@@ -6,6 +6,9 @@ edition = "2018"
 description = "A cli tool and bridge implementing the lifx lan protocol v2.0"
 
 [dependencies]
+log = "^0.4"
 num-derive = "^0.3"
 num-traits = "^0.2"
 serde = "^1.0"
+simplelog = "^0.9"
+structopt = "^0.3"
