@@ -1,819 +1,713 @@
-use num_traits::*;
+use super::{
+    types::*,
+    util,
+};
 
-use super::messages::{*, Message::*};
-use super::types::*;
-use super::util;
+const TYPE_OFFSET: usize = 32;
 
-#[derive(Clone)]
-pub struct PacketBuilder(Packet);
-#[derive(Clone)]
-pub struct Header(Packet);
+pub fn pack(header: &Header, message: &dyn Message) -> Vec<u8> {
+    let mut pack = header.pack();
+    pack.extend_from_slice(&message.pack());
+    let msg_type = (message.get_type() as u16).to_le_bytes();
+    let pack_size = (pack.len() as u16).to_le_bytes();
+    for i in 0..2 {
+        pack[i] = pack_size[i];
+        pack[i + TYPE_OFFSET] = msg_type[i];
+    }
+    pack
+}
 
-impl PacketBuilder {
-    fn reserve(&mut self, count_bytes: usize) {
-        self.0.extend_from_slice(&vec![0u8; count_bytes]);
+macro_rules! primitive_packs {
+    ($($t:ty),+ $(,)?) => {
+        $(impl Pack for $t {
+            fn pack(&self) -> Vec<u8> {
+                self.to_le_bytes().to_vec()
+            }
+        }
+        impl Pack for &$t {
+            fn pack(&self) -> Vec<u8> {
+                self.to_le_bytes().to_vec()
+            }
+        })+
+    };
+}
+
+primitive_packs!(u8, u16, u32, u64, i16, i64, f32);
+
+struct PackHelper(Vec<u8>);
+
+impl PackHelper {
+    fn new() -> Self { PackHelper(Vec::new()) }
+
+    fn push<T: Pack>(&mut self, v: T) -> &mut Self {
+        self.0.extend_from_slice(&v.pack());
+        self
     }
 
-    pub fn new() -> Self {
-        Self(Vec::new())
+    fn push_all<I>(&mut self, vs: I) -> &mut Self
+    where
+        I: IntoIterator,
+        I::Item: Pack,
+    {
+        for v in vs {
+            self.0.extend_from_slice(&v.pack());
+        }
+        self
     }
 
-    pub fn header(
-        mut self,
-        tagged: bool,
-        source: u32,
-        target: MACAddress,
-        res_required: bool,
-        ack_required: bool,
-        sequence: u8,
-    ) -> Header {
-        self.0.extend_from_slice(&[0u8; 2]); // size (to be filled later)
-        self.0.push(0u8); // low byte of origin, tagged, addressable, protocol
-        if tagged {
-            self.0.push(0b00_1_1_0100);
-        } else {
-            self.0.push(0b00_0_1_0100);
-        }
-        self.0.extend_from_slice(&source.to_le_bytes());
-        match target {
-            MACAddress::All => self.0.extend_from_slice(&[0u8; 8]),
-            MACAddress::Eui48(addr) => {
-                self.0.extend_from_slice(&addr);
-                self.reserve(2);
-            },
-            MACAddress::Eui64(_addr) =>
-                unimplemented!("LIFX devices don't accept EUI64 addresses"),
-        }
-        self.reserve(6);
-        self.0.push(
-            if res_required { 0b01u8 } else { 0u8 } |
-            if ack_required { 0b10u8 } else { 0u8 }
-        );
-        self.0.push(sequence);
-        self.reserve(12); // 8 reserved
-                          // 2 type (to be filled later)
-                          // 2 reserved
+    fn push_slice(&mut self, slice: &[u8]) -> &mut Self {
+        self.0.extend_from_slice(slice);
+        self
+    }
 
-        Header(self.0)
+    fn reserve(&mut self, bytes: usize) -> &mut Self {
+        self.0.reserve(bytes);
+        for _ in 0..bytes {
+            self.0.push(0);
+        }
+        self
+    }
+
+    fn push_bool(&mut self, b: bool) -> &mut Self {
+        self.0.push(if b { 1u8 } else { 0u8 });
+        self
+    }
+
+    fn push_powered(&mut self, p: bool) -> &mut Self {
+        self.push(if p { 65535u16 } else { 0u16 });
+        self
+    }
+
+    fn pack(&mut self) -> Vec<u8> { self.0.clone() }
+}
+
+impl Pack for MacAddress {
+    fn pack(&self) -> Vec<u8> {
+        let mut pack = PackHelper::new();
+        match self {
+            MacAddress::All => { pack.reserve(8); },
+            MacAddress::Eui48(addr) => { pack.push_slice(addr).reserve(2); },
+            //MacAddress::Eui64(_addr) =>
+                //unimplemented!("LIFX devices don't accept EUI64 addresses"),
+        }
+        pack.pack()
     }
 }
 
-impl Header {
-    // Private Helpers
-
-    // set the size and return the finished packet
-    fn finalize(&mut self) -> Packet {
-        // make sure that type is set
-        if self.0[32] == 0 && self.0[33] == 0 {
-            panic!("Packet type hasn't been set (this is a bug)");
-        }
-
-        let val = (self.0.len() as u16).to_le_bytes();
-        for i in 0..2 {
-            self.0[i] = val[i];
-        }
-        self.0.to_owned()
+impl Pack for HSBK {
+    fn pack(&self) -> Vec<u8> {
+        // hue value is scaled from 0-360 to 0-65535
+        let hue_conv = self.hue() / 360.0 * 65535.0;
+        PackHelper::new()
+            .push(hue_conv as u16)
+            .push(self.saturation())
+            .push(self.brightness())
+            .push(self.kelvin())
+            .pack()
     }
+}
 
-    fn set_type(&mut self, val: Message) {
-        let val = val.to_u16().unwrap().to_le_bytes();
-        let offset = 32;
-        for i in 0..2 {
-            self.0[i + offset] = val[i];
-        }
+impl Pack for &HSBK {
+    fn pack(&self) -> Vec<u8> {
+        (*self).pack()
     }
+}
 
-    // no payload
-    fn np(mut self, val: Message) -> Packet {
-        self.set_type(val);
-        self.finalize()
+impl Pack for Tile {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.accel_meas_x)
+            .push(self.accel_meas_y)
+            .push(self.accel_meas_z)
+            .reserve(2)
+            .push(self.user_x)
+            .push(self.user_y)
+            .push(self.width)
+            .push(self.height)
+            .reserve(1)
+            .push(self.device_vendor)
+            .push(self.device_product)
+            .push(self.device_version)
+            .push(self.firmware_build)
+            .reserve(8)
+            .push(self.firmware_minor)
+            .push(self.firmware_major)
+            .reserve(4)
+            .pack()
     }
+}
 
-    fn reserve(&mut self, count_bytes: usize) {
-        self.0.extend_from_slice(&vec![0u8; count_bytes]);
+impl Pack for &Tile {
+    fn pack(&self) -> Vec<u8> {
+        (*self).pack()
     }
+}
 
-    // Device Messages
-
-    pub fn get_service(mut self) -> Packet { self.np(GetService) }
-
-    pub fn state_service(mut self, service: u8, port: u32) -> Packet {
-        self.set_type(StateService);
-        self.0.push(service);
-        self.0.extend_from_slice(&port.to_le_bytes());
-        self.finalize()
+impl Pack for Header {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .reserve(3) // size (to be filled later) and low byte of origin,
+                        // tagged, addressable, protocol
+            .push(if self.tagged { 0b00_1_1_0100u8 } else { 0b00_0_1_0100u8 })
+            .push(self.source)
+            .push(self.target)
+            .reserve(6)
+            .push(
+            if self.res_required { 0b01u8 } else { 0u8 } |
+            if self.ack_required { 0b10u8 } else { 0u8 }
+            )
+            .push(self.sequence)
+            .reserve(12) // 8 reserved
+                         // 2 type (to be filled later)
+                         // 2 reserved
+            .pack()
     }
+}
 
-    pub fn get_host_info(mut self) -> Packet { self.np(GetHostInfo) }
+// Device Messages
+impl Pack for GetService {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
 
-    pub fn state_host_info(mut self, signal: f32, tx: u32, rx: u32) -> Packet {
-        self.set_type(StateHostInfo);
-        self.0.extend_from_slice(&signal.to_le_bytes());
-        self.0.extend_from_slice(&tx.to_le_bytes());
-        self.0.extend_from_slice(&rx.to_le_bytes());
-        self.reserve(2);
-        self.finalize()
+impl Pack for StateService {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.service)
+        .push(self.port)
+        .pack()
     }
+}
 
-    pub fn get_host_firmware(mut self) -> Packet { self.np(GetHostFirmware) }
+impl Pack for GetHostInfo {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
 
-    pub fn state_host_firmware(
-        mut self,
-        build: u64,
-        version_minor: u16,
-        version_major: u16,
-    ) -> Packet {
-        self.set_type(StateHostFirmware);
-        self.0.extend_from_slice(&build.to_le_bytes());
-        self.reserve(8);
-        self.0.extend_from_slice(&version_minor.to_le_bytes());
-        self.0.extend_from_slice(&version_major.to_le_bytes());
-        self.finalize()
+impl Pack for StateHostInfo {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.signal)
+        .push(self.tx)
+        .push(self.rx)
+        .pack()
     }
+}
 
-    pub fn get_wifi_info(mut self) -> Packet { self.np(GetWifiInfo) }
+impl Pack for GetHostFirmware {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
 
-    pub fn state_wifi_info(mut self, signal: f32, tx: u32, rx: u32) -> Packet {
-        self.set_type(StateHostInfo);
-        self.0.extend_from_slice(&signal.to_le_bytes());
-        self.0.extend_from_slice(&tx.to_le_bytes());
-        self.0.extend_from_slice(&rx.to_le_bytes());
-        self.reserve(2);
-        self.finalize()
+impl Pack for StateHostFirmware {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.build)
+        .reserve(8)
+        .push(self.version_minor)
+        .push(self.version_major)
+        .pack()
     }
+}
 
-    pub fn get_wifi_firmware(mut self) -> Packet { self.np(GetWifiFirmware) }
+impl Pack for GetWifiInfo {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
 
-    pub fn state_wifi_firmware(
-        mut self,
-        build: u64,
-        version_minor: u16,
-        version_major: u16,
-    ) -> Packet {
-        self.set_type(StateHostFirmware);
-        self.0.extend_from_slice(&build.to_le_bytes());
-        self.reserve(8);
-        self.0.extend_from_slice(&version_minor.to_le_bytes());
-        self.0.extend_from_slice(&version_major.to_le_bytes());
-        self.finalize()
+impl Pack for StateWifiInfo {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.signal)
+        .push(self.tx)
+        .push(self.rx)
+        .reserve(2)
+        .pack()
     }
+}
 
-    pub fn get_power(mut self) -> Packet { self.np(GetPower) }
+impl Pack for GetWifiFirmware {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
 
-    pub fn set_power(mut self, powered: bool) -> Packet {
-        self.set_type(SetPower);
-        self.0.extend_from_slice(
-            &(if powered { 65535u16 } else { 0u16 }).to_le_bytes());
-        self.finalize()
+impl Pack for StateWifiFirmware {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.build)
+        .reserve(8)
+        .push(self.version_minor)
+        .push(self.version_major)
+        .pack()
     }
+}
 
-    pub fn state_power(mut self, powered: bool) -> Packet {
-        self.set_type(StatePower);
-        self.0.extend_from_slice(
-            &(if powered { 65535u16 } else { 0u16 }).to_le_bytes());
-        self.finalize()
+impl Pack for GetPower {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for SetPower {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_powered(self.powered)
+        .pack()
     }
+}
 
-    pub fn get_label(mut self) -> Packet { self.np(GetLabel) }
-
-    pub fn set_label(mut self, label: &str) -> Packet {
-        self.set_type(SetLabel);
-        self.0.extend_from_slice(&util::label_helper(label));
-        self.finalize()
+impl Pack for StatePower {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_powered(self.powered)
+        .pack()
     }
+}
 
-    pub fn state_label(mut self, label: &str) -> Packet {
-        self.set_type(StateLabel);
-        self.0.extend_from_slice(&util::label_helper(label));
-        self.finalize()
+impl Pack for GetLabel {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for SetLabel {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_slice(&self.label)
+        .pack()
     }
+}
 
-    pub fn get_version(mut self) -> Packet { self.np(GetVersion) }
-
-    pub fn state_version(
-        mut self,
-        vendor: u32,
-        product: u32,
-        version: u32,
-    ) -> Packet {
-        self.set_type(StateVersion);
-        self.0.extend_from_slice(&vendor.to_le_bytes());
-        self.0.extend_from_slice(&product.to_le_bytes());
-        self.0.extend_from_slice(&version.to_le_bytes());
-        self.finalize()
+impl Pack for StateLabel {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_slice(&self.label)
+        .pack()
     }
+}
 
-    pub fn get_info(mut self) -> Packet { self.np(GetInfo) }
+impl Pack for GetVersion {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
 
-    pub fn state_info(
-        mut self,
-        time: u64,
-        uptime: u64,
-        downtime: u64,
-    ) -> Packet {
-        self.set_type(StateInfo);
-        self.0.extend_from_slice(&time.to_le_bytes());
-        self.0.extend_from_slice(&uptime.to_le_bytes());
-        self.0.extend_from_slice(&downtime.to_le_bytes());
-        self.finalize()
+impl Pack for StateVersion {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.vendor)
+        .push(self.product)
+        .push(self.version)
+        .pack()
     }
+}
 
-    pub fn acknowledgement(mut self) -> Packet { self.np(Acknowledgement) }
+impl Pack for GetInfo {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
 
-    pub fn get_location(mut self) -> Packet { self.np(GetLocation) }
-
-    pub fn set_location(
-        mut self,
-        location: &[u8; 16],
-        label: &str,
-        updated_at: i64,
-    ) -> Packet {
-        self.set_type(SetLocation);
-        self.0.extend_from_slice(location);
-        self.0.extend_from_slice(&util::label_helper(label));
-        self.0.extend_from_slice(&updated_at.to_le_bytes());
-        self.finalize()
+impl Pack for StateInfo {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.time)
+        .push(self.uptime)
+        .push(self.downtime)
+        .pack()
     }
+}
 
-    pub fn state_location(
-        mut self,
-        location: &[u8; 16],
-        label: &str,
-        updated_at: i64,
-    ) -> Packet {
-        self.set_type(StateLocation);
-        self.0.extend_from_slice(location);
-        self.0.extend_from_slice(&util::label_helper(label));
-        self.0.extend_from_slice(&updated_at.to_le_bytes());
-        self.finalize()
+impl Pack for Acknowledgement {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for GetLocation {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for SetLocation {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_slice(&self.location)
+        .push_slice(&self.label)
+        .push(self.updated_at)
+        .pack()
     }
+}
 
-    pub fn get_group(mut self) -> Packet { self.np(GetGroup) }
-
-    pub fn set_group(
-        mut self,
-        group: &[u8; 16],
-        label: &str,
-        updated_at: i64,
-    ) -> Packet {
-        self.set_type(SetGroup);
-        self.0.extend_from_slice(group);
-        self.0.extend_from_slice(&util::label_helper(label));
-        self.0.extend_from_slice(&updated_at.to_le_bytes());
-        self.finalize()
+impl Pack for StateLocation {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_slice(&self.location)
+        .push_slice(&self.label)
+        .push(self.updated_at)
+        .pack()
     }
+}
 
-    pub fn state_group(
-        mut self,
-        group: &[u8; 16],
-        label: &str,
-        updated_at: i64,
-    ) -> Packet {
-        self.set_type(StateGroup);
-        self.0.extend_from_slice(group);
-        self.0.extend_from_slice(&util::label_helper(label));
-        self.0.extend_from_slice(&updated_at.to_le_bytes());
-        self.finalize()
+impl Pack for GetGroup {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for SetGroup {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_slice(&self.group)
+        .push_slice(&self.label)
+        .push(self.updated_at)
+        .pack()
     }
+}
 
-    pub fn echo_request(mut self, payload: &[u8; 8]) -> Packet {
-        self.set_type(EchoRequest);
-        self.0.extend_from_slice(payload);
-        self.finalize()
+impl Pack for StateGroup {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_slice(&self.group)
+        .push_slice(&self.label)
+        .push(self.updated_at)
+        .pack()
     }
+}
 
-    pub fn echo_response(mut self, payload: &[u8; 8]) -> Packet {
-        self.set_type(EchoRequest);
-        self.0.extend_from_slice(payload);
-        self.finalize()
+impl Pack for EchoRequest {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_slice(&self.payload)
+        .pack()
     }
+}
 
-    // Light Messages
-
-    pub fn get(mut self) -> Packet { self.np(Get) }
-
-    pub fn set_color(mut self, color: HSBK, duration: u32) -> Packet {
-        self.set_type(SetColor);
-        self.reserve(1);
-        self.0.extend_from_slice(&color.pack());
-        self.0.extend_from_slice(&duration.to_le_bytes());
-        self.finalize()
+impl Pack for EchoResponse {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_slice(&self.payload)
+        .pack()
     }
+}
 
-    pub fn set_waveform(
-        mut self,
-        transient: bool,
-        color: HSBK,
-        period: u32,
-        cycles: f32,
-        skew_ratio: f32,
-        waveform: u8,
-    ) -> Packet {
-        // transform from [0, 1] to [-32768, 32767] per spec
-        let skew =
-            (util::clamp(skew_ratio, 0.0, 1.0) * 65535.0 - 32768.0) as u16;
 
-        self.set_type(SetWaveform);
-        self.reserve(1);
-        self.0.push(if transient { 1u8 } else { 0u8 });
-        self.0.extend_from_slice(&color.pack());
-        self.0.extend_from_slice(&period.to_le_bytes());
-        self.0.extend_from_slice(&cycles.to_le_bytes());
-        self.0.extend_from_slice(&skew.to_le_bytes());
-        self.0.push(waveform);
-        self.finalize()
+// Light Messages
+impl Pack for Get {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for SetColor {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .reserve(1)
+        .push(self.color)
+        .push(self.duration)
+        .pack()
     }
+}
 
-    pub fn set_waveform_optional(
-        mut self,
-        transient: bool,
-        color: HSBK,
-        period: u32,
-        cycles: f32,
-        skew_ratio: f32,
-        waveform: u8,
-        set_hue: bool,
-        set_saturation: bool,
-        set_brightness: bool,
-        set_kelvin: bool,
-    ) -> Packet {
-        // transform from [0, 1] to [-32768, 32767] per spec
-        let skew =
-            (util::clamp(skew_ratio, 0.0, 1.0) * 65535.0 - 32768.0) as u16;
-
-        self.set_type(SetWaveformOptional);
-        self.reserve(1);
-        self.0.push(if transient { 1u8 } else { 0u8 });
-        self.0.extend_from_slice(&color.pack());
-        self.0.extend_from_slice(&period.to_le_bytes());
-        self.0.extend_from_slice(&cycles.to_le_bytes());
-        self.0.extend_from_slice(&skew_ratio.to_le_bytes());
-        self.0.push(waveform);
-        self.0.push(if set_hue { 1u8 } else { 0u8 });
-        self.0.push(if set_saturation { 1u8 } else { 0u8 });
-        self.0.push(if set_brightness { 1u8 } else { 0u8 });
-        self.0.push(if set_kelvin { 1u8 } else { 0u8 });
-        self.finalize()
+impl Pack for SetWaveform {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .reserve(1)
+        .push_bool(self.transient)
+        .push(self.color)
+        .push(self.period)
+        .push(self.cycles)
+        .push(util::conv_skew(self.skew_ratio))
+        .push(self.waveform)
+        .pack()
     }
+}
 
-    pub fn state(
-        mut self,
-        color: HSBK,
-        powered: bool,
-        label: &str,
-    ) -> Packet {
-        self.set_type(State);
-        self.0.extend_from_slice(&color.pack());
-        self.reserve(2);
-        self.0.extend_from_slice(
-            &(if powered { 65535u16 } else { 0u16 }).to_le_bytes());
-        self.0.extend_from_slice(&util::label_helper(label));
-        self.reserve(8);
-        self.finalize()
+impl Pack for SetWaveformOptional {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .reserve(1)
+        .push_bool(self.transient)
+        .push(self.color)
+        .push(self.period)
+        .push(self.cycles)
+        .push(util::conv_skew(self.skew_ratio))
+        .push(self.waveform)
+        .push_bool(self.set_hue)
+        .push_bool(self.set_saturation)
+        .push_bool(self.set_brightness)
+        .push_bool(self.set_kelvin)
+        .pack()
     }
+}
 
-    pub fn get_light_power(mut self) -> Packet { self.np(GetLightPower) }
-
-    pub fn set_light_power(mut self, powered: bool, duration: u32) -> Packet {
-        self.set_type(SetLightPower);
-        self.0.extend_from_slice(
-            &(if powered { 65535u16 } else { 0u16 }).to_le_bytes());
-        self.0.extend_from_slice(&duration.to_le_bytes());
-        self.finalize()
+impl Pack for State {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.color)
+        .reserve(2)
+        .push_powered(self.powered)
+        .push_slice(&self.label)
+        .pack()
     }
+}
 
-    pub fn state_light_power(mut self, powered: bool) -> Packet {
-        self.set_type(SetLightPower);
-        self.0.extend_from_slice(
-            &(if powered { 65535u16 } else { 0u16 }).to_le_bytes());
-        self.finalize()
+impl Pack for GetLightPower {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for SetLightPower {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_powered(self.powered)
+        .push(self.duration)
+        .pack()
     }
+}
 
-    pub fn get_infrared(mut self) -> Packet { self.np(GetInfrared) }
-
-    pub fn state_infrared(mut self, brightness: u16) -> Packet {
-        self.set_type(StateInfrared);
-        self.0.extend_from_slice(&brightness.to_le_bytes());
-        self.finalize()
+impl Pack for StateLightPower {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push_powered(self.powered)
+        .pack()
     }
+}
 
-    pub fn set_infrared(mut self, brightness: u16) -> Packet {
-        self.set_type(SetInfrared);
-        self.0.extend_from_slice(&brightness.to_le_bytes());
-        self.finalize()
+impl Pack for GetInfrared {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for StateInfrared {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.brightness)
+        .pack()
     }
+}
 
-    // MultiZone Messages
-
-    pub fn set_extended_color_zones(
-        mut self,
-        duration: u32,
-        apply: ApplicationRequest,
-        index: u16,
-        colors_count: u8,
-        colors: &[HSBK; 82],
-    ) -> Packet {
-        self.set_type(SetExtendedColorZones);
-        self.0.extend_from_slice(&duration.to_le_bytes());
-        self.0.push(apply as u8);
-        self.0.extend_from_slice(&index.to_le_bytes());
-        self.0.push(colors_count);
-        for color in colors {
-            self.0.extend_from_slice(&color.pack());
-        }
-        self.finalize()
+impl Pack for SetInfrared {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.brightness)
+        .pack()
     }
+}
 
-    pub fn get_extended_color_zones(mut self) -> Packet {
-        self.np(GetExtendedColorZones)
+
+// MultiZone Message
+impl Pack for SetExtendedColorZones {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.duration)
+        .push(self.apply as u8)
+        .push(self.index)
+        .push(self.colors_count)
+        .push_all(&self.colors)
+        .pack()
     }
+}
 
-    pub fn state_extended_color_zones(
-        mut self,
-        count: u16,
-        index: u16,
-        colors_count: u8,
-        colors: &[HSBK; 82],
-    ) -> Packet {
-        self.set_type(StateExtendedColorZones);
-        self.0.extend_from_slice(&count.to_le_bytes());
-        self.0.extend_from_slice(&index.to_le_bytes());
-        self.0.push(colors_count);
-        for color in colors {
-            self.0.extend_from_slice(&color.pack());
-        }
-        self.finalize()
+impl Pack for GetExtendedColorZones {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for StateExtendedColorZones {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.duration)
+        .push(self.apply as u8)
+        .push(self.index)
+        .push(self.colors_count)
+        .push_all(&self.colors)
+        .pack()
     }
+}
 
-    pub fn set_color_zones(
-        mut self,
-        start_index: u8,
-        end_index: u8,
-        color: HSBK,
-        duration: u32,
-        apply: ApplicationRequest,
-    ) -> Packet {
-        self.set_type(SetColorZones);
-        self.0.push(start_index);
-        self.0.push(end_index);
-        self.0.extend_from_slice(&color.pack());
-        self.0.extend_from_slice(&duration.to_le_bytes());
-        self.0.push(apply as u8);
-        self.finalize()
+impl Pack for SetColorZones {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.start_index)
+        .push(self.end_index)
+        .push(self.color)
+        .push(self.duration)
+        .push(self.apply as u8)
+        .pack()
     }
+}
 
-    pub fn get_color_zones(
-        mut self,
-        start_index: u8,
-        end_index: u8,
-    ) -> Packet {
-        self.set_type(GetColorZones);
-        self.0.push(start_index);
-        self.0.push(end_index);
-        self.finalize()
+impl Pack for GetColorZones {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.start_index)
+        .push(self.end_index)
+        .pack()
     }
+}
 
-    pub fn state_zone(
-        mut self,
-        count: u8,
-        index: u8,
-        color: HSBK,
-    ) -> Packet {
-        self.set_type(StateZone);
-        self.0.push(count);
-        self.0.push(index);
-        self.0.extend_from_slice(&color.pack());
-        self.finalize()
+impl Pack for StateZone {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.count)
+        .push(self.index)
+        .push(self.color)
+        .pack()
     }
+}
 
-    pub fn state_multi_zone(
-        mut self,
-        count: u8,
-        index: u8,
-        colors: &[HSBK; 8],
-    ) -> Packet {
-        self.set_type(StateMultiZone);
-        self.0.push(count);
-        self.0.push(index);
-        for color in colors {
-            self.0.extend_from_slice(&color.pack());
-        }
-        self.finalize()
+impl Pack for StateMultiZone {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+        .push(self.count)
+        .push(self.index)
+        .push_all(&self.colors)
+        .pack()
     }
+}
 
-    // Tile Messages
 
-    pub fn get_device_chain(mut self) -> Packet { self.np(GetDeviceChain) }
+// Tile Messages
+impl Pack for GetDeviceChain {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
 
-    pub fn state_device_chain(
-        mut self,
-        start_index: u8,
-        tile_devices: &[Tile; 16],
-        total_count: u8,
-    ) -> Packet {
-        self.set_type(StateDeviceChain);
-        self.0.push(start_index);
-        for tile in tile_devices {
-            self.0.extend(tile.pack());
-        }
-        self.0.push(total_count);
-        self.finalize()
+impl Pack for StateDeviceChain {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.start_index)
+            .push_all(&self.tile_devices)
+            .push(self.total_count)
+            .pack()
     }
+}
 
-    pub fn set_user_position(
-        mut self,
-        tile_index: u8,
-        user_x: f32,
-        user_y: f32,
-    ) -> Packet {
-        self.set_type(SetUserPosition);
-        self.0.push(tile_index);
-        self.reserve(2);
-        self.0.extend_from_slice(&user_x.to_le_bytes());
-        self.0.extend_from_slice(&user_y.to_le_bytes());
-        self.finalize()
+impl Pack for SetUserPosition {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.tile_index)
+            .reserve(2)
+            .push(self.user_x)
+            .push(self.user_y)
+            .pack()
     }
+}
 
-    pub fn get_tile_state_64(
-        mut self,
-        tile_index: u8,
-        length: u8,
-        x: u8,
-        y: u8,
-        width: u8,
-    ) -> Packet {
-        self.set_type(GetTileState64);
-        self.0.push(tile_index);
-        self.0.push(length);
-        self.reserve(1);
-        self.0.push(x);
-        self.0.push(y);
-        self.0.push(width);
-        self.finalize()
+impl Pack for GetTileState64 {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.tile_index)
+            .push(self.length)
+            .reserve(1)
+            .push(self.x)
+            .push(self.y)
+            .push(self.width)
+            .pack()
     }
+}
 
-    pub fn state_tile_state_64(
-        mut self,
-        tile_index: u8,
-        x: u8,
-        y: u8,
-        width: u8,
-        colors: &[HSBK; 64],
-    ) -> Packet {
-        self.set_type(GetTileState64);
-        self.0.push(tile_index);
-        self.reserve(1);
-        self.0.push(x);
-        self.0.push(y);
-        self.0.push(width);
-        for color in colors {
-            self.0.extend_from_slice(&color.pack());
-        }
-        self.finalize()
+impl Pack for StateTileState64 {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.tile_index)
+            .reserve(1)
+            .push(self.x)
+            .push(self.y)
+            .push(self.width)
+            .push_all(&self.colors)
+            .pack()
     }
+}
 
-    pub fn set_tile_state_64(
-        mut self,
-        tile_index: u8,
-        length: u8,
-        x: u8,
-        y: u8,
-        width: u8,
-        duration: u32,
-        colors: &[HSBK; 64],
-    ) -> Packet {
-        self.set_type(GetTileState64);
-        self.0.push(tile_index);
-        self.0.push(length);
-        self.reserve(1);
-        self.0.push(x);
-        self.0.push(y);
-        self.0.push(width);
-        self.0.extend_from_slice(&duration.to_le_bytes());
-        for color in colors {
-            self.0.extend_from_slice(&color.pack());
-        }
-        self.finalize()
+impl Pack for SetTileState64 {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.tile_index)
+            .push(self.length)
+            .reserve(1)
+            .push(self.x)
+            .push(self.y)
+            .push(self.width)
+            .push_all(&self.colors)
+            .pack()
     }
+}
 
-    // Switch Messages
-
-    pub fn get_relay_power(mut self, relay_index: u8) -> Packet {
-        self.set_type(GetRelayPower);
-        self.0.push(relay_index);
-        self.finalize()
+// Switch Messages
+impl Pack for GetRelayPower {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.relay_index)
+            .pack()
     }
+}
 
-    pub fn set_relay_power(
-        mut self,
-        relay_index: u8,
-        powered: bool,
-    ) -> Packet {
-        self.set_type(SetRelayPower);
-        self.0.push(relay_index);
-        self.0.extend_from_slice(
-            &(if powered { 65535u16 } else { 0u16 }).to_le_bytes());
-        self.finalize()
+impl Pack for SetRelayPower {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.relay_index)
+            .push_powered(self.powered)
+            .pack()
     }
+}
 
-    pub fn state_relay_power(
-        mut self,
-        relay_index: u8,
-        powered: bool,
-    ) -> Packet {
-        self.set_type(StateRelayPower);
-        self.0.push(relay_index);
-        self.0.extend_from_slice(
-            &(if powered { 65535u16 } else { 0u16 }).to_le_bytes());
-        self.finalize()
+impl Pack for StateRelayPower {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.relay_index)
+            .push_powered(self.powered)
+            .pack()
     }
+}
 
-    // Firmware Effects
-
-    pub fn set_multi_zone_effect(
-        mut self,
-        instanceid: u32,
-        etype: MultiZoneEffectType,
-        speed: u32,
-        duration: u64,
-        parameters: &[u32; 8],
-    ) -> Packet {
-        self.set_type(SetMultiZoneEffect);
-        self.0.extend_from_slice(&instanceid.to_le_bytes());
-        self.0.push(etype as u8);
-        self.reserve(2);
-        self.0.extend_from_slice(&speed.to_le_bytes());
-        self.0.extend_from_slice(&duration.to_le_bytes());
-        self.reserve(8);
-        for parameter in parameters {
-            self.0.extend_from_slice(&parameter.to_le_bytes());
-        }
-        self.finalize()
+// Firmware Effects
+impl Pack for SetMultiZoneEffect {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.instanceid)
+            .push(self.etype as u8)
+            .reserve(2)
+            .push(self.speed)
+            .push(self.duration)
+            .reserve(8)
+            .push_all(&self.parameters)
+            .pack()
     }
+}
 
-    pub fn set_tile_effect(
-        mut self,
-        instanceid: u32,
-        etype: TileEffectType,
-        speed: u32,
-        duration: u64,
-        parameters: &[u32; 8],
-        palette_count: u8,
-        palette: &[HSBK; 16],
-    ) -> Packet {
-        self.set_type(SetTileEffect);
-        self.reserve(2);
-        self.0.extend_from_slice(&instanceid.to_le_bytes());
-        self.0.push(etype as u8);
-        self.0.extend_from_slice(&speed.to_le_bytes());
-        self.0.extend_from_slice(&duration.to_le_bytes());
-        self.reserve(8);
-        for parameter in parameters {
-            self.0.extend_from_slice(&parameter.to_le_bytes());
-        }
-        self.0.push(palette_count);
-        for color in palette {
-            self.0.extend_from_slice(&color.pack());
-        }
-        self.finalize()
+impl Pack for GetMultiZoneEffect {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for StateMultiZoneEffect {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .push(self.instanceid)
+            .push(self.etype as u8)
+            .reserve(2)
+            .push(self.speed)
+            .push(self.duration)
+            .reserve(8)
+            .push_all(&self.parameters)
+            .pack()
     }
+}
 
-    pub fn get_tile_effect(mut self) -> Packet { self.np(GetTileEffect) }
+impl Pack for SetTileEffect {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .reserve(2)
+            .push(self.instanceid)
+            .push(self.etype as u8)
+            .push(self.speed)
+            .push(self.duration)
+            .reserve(8)
+            .push_all(&self.parameters)
+            .push(self.palette_count)
+            .push_all(&self.palette)
+            .pack()
+    }
+}
 
-    pub fn state_tile_effect(
-        mut self,
-        instanceid: u32,
-        etype: TileEffectType,
-        speed: u32,
-        duration: u64,
-        parameters: &[u32; 8],
-        palette_count: u8,
-        palette: &[HSBK; 16],
-    ) -> Packet {
-        self.set_type(SetTileEffect);
-        self.reserve(2);
-        self.0.extend_from_slice(&instanceid.to_le_bytes());
-        self.0.push(etype as u8);
-        self.0.extend_from_slice(&speed.to_le_bytes());
-        self.0.extend_from_slice(&duration.to_le_bytes());
-        self.reserve(8);
-        for parameter in parameters {
-            self.0.extend_from_slice(&parameter.to_le_bytes());
-        }
-        self.0.push(palette_count);
-        for color in palette {
-            self.0.extend_from_slice(&color.pack());
-        }
-        self.finalize()
+impl Pack for GetTileEffect {
+    fn pack(&self) -> Vec<u8> { Vec::new() }
+}
+
+impl Pack for StateTileEffect {
+    fn pack(&self) -> Vec<u8> {
+        PackHelper::new()
+            .reserve(2)
+            .push(self.instanceid)
+            .push(self.etype as u8)
+            .push(self.speed)
+            .push(self.duration)
+            .reserve(8)
+            .push_all(&self.parameters)
+            .push(self.palette_count)
+            .push_all(&self.palette)
+            .pack()
     }
 }
 
 // Tests
-
-#[test]
-fn test_all_packets_build() {
-    let header = PacketBuilder::new().header(
-        true,
-        0,
-        MACAddress::Eui48([0, 0, 0, 0, 0, 0]),
-        false,
-        false,
-        0,
-    );
-
-    header.clone().get_service();
-    header.clone().state_service(0, 0);
-    header.clone().get_host_info();
-    header.clone().state_host_info(0.0, 0, 0);
-    header.clone().get_host_firmware();
-    header.clone().state_host_firmware(0, 0, 0);
-    header.clone().get_wifi_info();
-    header.clone().state_wifi_info(0.0, 0, 0);
-    header.clone().get_wifi_firmware();
-    header.clone().state_wifi_firmware(0, 0, 0);
-    header.clone().get_power();
-    header.clone().set_power(true);
-    header.clone().state_power(true);
-    header.clone().get_label();
-    header.clone().set_label("");
-    header.clone().state_label("");
-    header.clone().get_version();
-    header.clone().state_version(0, 0, 0);
-    header.clone().get_info();
-    header.clone().state_info(0, 0, 0);
-    header.clone().acknowledgement();
-    header.clone().get_location();
-    header.clone().set_location(&[0u8; 16], "", 0);
-    header.clone().state_location(&[0u8; 16], "", 0);
-    header.clone().get_group();
-    header.clone().set_group(&[0u8; 16], "", 0);
-    header.clone().state_group(&[0u8; 16], "", 0);
-    header.clone().echo_request(&[0u8; 8]);
-    header.clone().echo_response(&[0u8; 8]);
-    header.clone().get();
-    header.clone().set_waveform(
-        true,
-        HSBK::new(0.0, 0, 0, 5000),
-        0, 0.0, 0.0, 0,
-    );
-    header.clone().set_waveform_optional(
-        true,
-        HSBK::new(0.0, 0, 0, 5000),
-        0, 0.0, 0.0, 0,
-        true, true, true, true,
-    );
-    header.clone().state(HSBK::new(0.0, 0, 0, 5000), true, "");
-    header.clone().get_light_power();
-    header.clone().set_light_power(true, 0);
-    header.clone().state_light_power(true);
-    header.clone().get_infrared();
-    header.clone().state_infrared(0);
-    header.clone().set_infrared(0);
-    header.clone().set_extended_color_zones(
-        0, ApplicationRequest::Apply, 0, 0,
-        &[HSBK::new(0.0, 0, 0, 5000); 82],
-    );
-    header.clone().get_extended_color_zones();
-    header.clone().state_extended_color_zones(
-        0, 0, 0,
-        &[HSBK::new(0.0, 0, 0, 5000); 82],
-    );
-    header.clone().set_color_zones(
-        0, 0, HSBK::new(0.0, 0, 0, 5000), 0,
-        ApplicationRequest::ApplyOnly,
-    );
-    header.clone().get_color_zones(0, 0);
-    header.clone().state_zone(0, 0, HSBK::new(0.0, 0, 0, 5000));
-    header.clone().state_multi_zone(0, 0, &[HSBK::new(0.0, 0, 0, 5000); 8]);
-    header.clone().get_device_chain();
-    header.clone().state_device_chain(
-        0,
-        &[Tile::new(0, 0, 0, 0.0, 0.0, 0, 0, 0, 0, 0, 0, 0, 0); 16],
-        0,
-    );
-    header.clone().set_user_position(0, 0.0, 0.0);
-    header.clone().get_tile_state_64(0, 0, 0, 0, 0);
-    header.clone().state_tile_state_64(
-        0, 0, 0, 0,
-        &[HSBK::new(0.0, 0, 0, 5000); 64]
-    );
-    header.clone().set_tile_state_64(
-        0, 0, 0, 0, 0, 0,
-        &[HSBK::new(0.0, 0, 0, 5000); 64]
-    );
-    header.clone().get_relay_power(0);
-    header.clone().set_relay_power(0, true);
-    header.clone().state_relay_power(0, true);
-    header.clone().set_multi_zone_effect(
-        0, MultiZoneEffectType::Move, 0, 0, &[0u32; 8]);
-    header.clone().set_tile_effect(
-        0, TileEffectType::Flame, 0, 0, &[0u32; 8], 0,
-        &[HSBK::new(0.0, 0, 0, 5000); 16]);
-    header.clone().get_tile_effect();
-    header.clone().state_tile_effect(
-        0, TileEffectType::Flame, 0, 0, &[0u32; 8], 0,
-        &[HSBK::new(0.0, 0, 0, 5000); 16]);
-}
 
 #[test]
 pub fn test_packet_matches_example() {
@@ -826,10 +720,21 @@ pub fn test_packet_matches_example() {
         0x00u8, 0x55u8, 0x55u8, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8, 0xACu8, 0x0Du8,
         0x00u8, 0x04u8, 0x00u8, 0x00u8,
     ];
-
-    let test = PacketBuilder::new()
-        .header(true, 0, MACAddress::All, false, false, 0)
-        .set_color(HSBK::new(120.0, u16::MAX, u16::MAX, 3500), 1024);
+    
+    let test = pack(
+        &Header {
+            tagged: true,
+            source: 0,
+            target: MacAddress::All,
+            res_required: false,
+            ack_required: false,
+            sequence: 0,
+        },
+        &SetColor {
+            color: HSBK::new(120.0, u16::MAX, u16::MAX, 3500),
+            duration: 1024,
+        },
+    );
 
     let result = example.iter().zip(test.iter())
         .filter(|(a, b)| a != b)

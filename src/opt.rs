@@ -26,6 +26,14 @@ pub struct Opt {
     )]
     pub log_level: sl::LevelFilter,
 
+    /// Number of milliseconds to wait for replies
+    #[structopt(
+        short,
+        long,
+        default_value = "5000",
+    )]
+    pub timeout: u32,
+
     #[structopt(subcommand)]
     pub cmd: Subcommand,
 }
