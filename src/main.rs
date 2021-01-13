@@ -4,7 +4,6 @@ use structopt::StructOpt;
 mod bridge;  // bridge driver
 mod error;   // errors
 mod opt;     // CLI parsing
-mod packing; // packet manipulation
 mod recv;    // recv driver
 mod emit;    // emit driver
 
