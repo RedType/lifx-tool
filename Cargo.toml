@@ -5,6 +5,10 @@ authors = ["William Young <wil.wyo@gmail.com>"]
 edition = "2018"
 description = "A cli tool and bridge implementing the lifx lan protocol v2.0"
 
+[profile.release]
+lto = true
+codegen-units = 1
+
 [dependencies]
 anyhow = "^1.0"
 lifx-core = "^0.2"
