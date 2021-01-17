@@ -11,6 +11,7 @@ codegen-units = 1
 
 [dependencies]
 anyhow = "^1.0"
+lazy_static = "^1.4"
 lifx-core = "^0.2"
 log = "^0.4"
 serde = "^1.0"
