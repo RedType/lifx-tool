@@ -5,7 +5,7 @@ use structopt::StructOpt;
 mod bridge;  // bridge driver
 mod emit;    // emit driver
 mod error;   // errors
-//mod net;     // networking
+mod net;     // networking
 mod opt;     // CLI parsing
 mod packing; // lan packet (de)serialization
 mod recv;    // recv driver
@@ -32,9 +32,9 @@ fn main() {
             show,
         } => {
             info!("performing roll call");
-            //let devices = net::roll_call(opt.timeout, |_| ()).unwrap();
+            let devices = net::roll_call(opt.timeout, |_| ()).unwrap();
 
-            //print!("{:?}", devices);
+            print!("{:?}", devices);
         },
         opt::Subcommand::Emit {
         } => todo!(),

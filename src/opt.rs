@@ -1,5 +1,14 @@
+use std::{
+    env,
+    path::PathBuf,
+};
+use lazy_static::*;
 use simplelog as sl;
 use structopt::StructOpt;
+
+lazy_static! {
+    static ref TEMP_FILE_DEFAULT: String = temp_file_default();
+}
 
 fn parse_log_level(name: &str) -> sl::LevelFilter {
     match name {
@@ -11,6 +20,12 @@ fn parse_log_level(name: &str) -> sl::LevelFilter {
         "trace" | "Trace" | "TRACE" => sl::LevelFilter::Trace,
         _ => panic!("Unexpected value \"{}\" for log_level", name),
     }
+}
+
+fn temp_file_default() -> String {
+    let prefix = env::temp_dir().into_os_string();
+    let ver = env!("CARGO_PKG_VERSION_MAJOR");
+    format!("{}/lifx-tool-cache.v{}.json", prefix.to_string_lossy(), ver)
 }
 
 #[derive(StructOpt)]
@@ -32,7 +47,7 @@ pub struct Opt {
         long,
         default_value = "5000",
     )]
-    pub timeout: u32,
+    pub timeout: u64,
 
     #[structopt(subcommand)]
     pub cmd: Subcommand,
@@ -51,6 +66,15 @@ pub enum Subcommand {
 
     /// Refreshes the lan device cache (TBI)
     Cache {
+        /// Specify which file to use as cache database
+        #[structopt(
+            short,
+            long,
+            default_value = &TEMP_FILE_DEFAULT,
+            parse(from_os_str),
+        )]
+        file: PathBuf,
+
         /// Do not update the cache (this option without show is a no-op)
         #[structopt(short, long)]
         no_update: bool,
@@ -63,11 +87,15 @@ pub enum Subcommand {
     },
 
     /// Sends a lifx packet to the network, and displays the response (if
-    /// requested) (TBI)
+    /// requested)
     Emit {
     },
 
     /// Listens for lifx packets on the local network and displays them (TBI)
     Recv {
     },
+}
+
+#[derive(StructOpt)]
+pub enum EmitMessage {
 }
